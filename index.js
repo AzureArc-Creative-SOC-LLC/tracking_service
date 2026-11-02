@@ -16,7 +16,8 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import jwt from 'jsonwebtoken'
-import { sendEmail } from '../emailService.js'
+import { sendEmail, brandThemeForDomain } from '../emailService.js'
+import { createDomainMiddleware } from './domainMiddleware.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -100,6 +101,14 @@ const pool = mysql.createPool(
         ssl: { rejectUnauthorized: false },
       }
 )
+
+const domainMiddleware = createDomainMiddleware({
+  lookupDomain: async (name) => {
+    const [rows] = await pool.execute('SELECT id, status FROM domains WHERE domain_name = ?', [name])
+    return rows[0] || null
+  },
+})
+app.use(domainMiddleware)
 
 function nowMysqlDatetime() {
   const d = new Date()
@@ -316,9 +325,9 @@ app.post('/api/trackingdetail/request-otp', async (req, res) => {
       const expiresAt = addSecondsMysql(OTP_TTL_SECONDS)
 
       await connection.execute(
-        `INSERT INTO tracking_otps (email, otp_hash, otp_salt, expires_at, used_at, attempts, created_at)
-         VALUES (?, ?, ?, ?, NULL, 0, ?)`,
-        [email, otpHash, salt, expiresAt, createdAt]
+        `INSERT INTO tracking_otps (email, otp_hash, otp_salt, expires_at, used_at, attempts, created_at, domain_id)
+         VALUES (?, ?, ?, ?, NULL, 0, ?, ?)`,
+        [email, otpHash, salt, expiresAt, createdAt, req.domainId]
       )
 
       try {
@@ -326,7 +335,7 @@ app.post('/api/trackingdetail/request-otp', async (req, res) => {
           email,
           'Your Alluvi Track Order OTP',
           'tracking_otp',
-          { otp, expiresMinutes: Math.ceil(OTP_TTL_SECONDS / 60) }
+          { otp, expiresMinutes: Math.ceil(OTP_TTL_SECONDS / 60), brandTheme: brandThemeForDomain(req.domain) }
         )
       } catch (e) {
         console.error('[tracking-service] OTP email send failed', e?.message || e)
@@ -418,16 +427,16 @@ app.post('/api/trackingdetail/verify-otp', async (req, res) => {
   }
 })
 
-async function fetchTrackingDetailsByEmail(email, limit) {
+async function fetchTrackingDetailsByEmail(email, limit, domainId) {
   const safeLimit = Math.min(Math.max(Number.parseInt(String(limit), 10) || 50, 1), 200)
   const normalizedEmail = String(email || '').trim().toLowerCase()
   const [ordersRows] = await pool.execute(
     `SELECT *
      FROM orders
-     WHERE LOWER(TRIM(customer_email)) = ?
+     WHERE LOWER(TRIM(customer_email)) = ? AND domain_id = ?
      ORDER BY created_at DESC
      LIMIT ${safeLimit}`,
-    [normalizedEmail]
+    [normalizedEmail, domainId]
   )
 
   const orders = Array.isArray(ordersRows) ? ordersRows : []
@@ -496,7 +505,7 @@ app.get('/api/trackingdetail/orders', requireOtpAccess, async (req, res) => {
 
     const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200)
 
-    const orders = await fetchTrackingDetailsByEmail(email, limit)
+    const orders = await fetchTrackingDetailsByEmail(email, limit, req.domainId)
     return res.json({ email, orders })
   } catch (e) {
     console.error('[tracking-service] failed to fetch orders', e)
@@ -513,10 +522,10 @@ app.get('/api/trackingdetail/address-change-requests', requireOtpAccess, async (
     const [rows] = await pool.execute(
       `SELECT *
        FROM order_address_change_requests
-       WHERE LOWER(TRIM(customer_email)) = ?
+       WHERE LOWER(TRIM(customer_email)) = ? AND domain_id = ?
        ORDER BY created_at DESC
        LIMIT ${Number.isFinite(limit) ? Math.trunc(limit) : 200}`,
-      [String(email).trim().toLowerCase()]
+      [String(email).trim().toLowerCase(), req.domainId]
     )
     return res.json({ requests: Array.isArray(rows) ? rows : [] })
   } catch (e) {
@@ -549,8 +558,8 @@ app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requir
     await connection.beginTransaction()
 
     const [orderRows] = await connection.execute(
-      `SELECT * FROM orders WHERE order_number = ? AND LOWER(TRIM(customer_email)) = ? LIMIT 1 FOR UPDATE`,
-      [orderNumber, String(email).trim().toLowerCase()]
+      `SELECT * FROM orders WHERE order_number = ? AND LOWER(TRIM(customer_email)) = ? AND domain_id = ? LIMIT 1 FOR UPDATE`,
+      [orderNumber, String(email).trim().toLowerCase(), req.domainId]
     )
 
     const orders = Array.isArray(orderRows) ? orderRows : []
@@ -588,8 +597,8 @@ app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requir
     const now = nowMysqlDatetime()
     const [ins] = await connection.execute(
       `INSERT INTO order_address_change_requests
-        (order_id, order_number, customer_email, current_shipping_json, requested_shipping_json, status, admin_id, admin_note, decided_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?)`,
+        (order_id, order_number, customer_email, current_shipping_json, requested_shipping_json, status, admin_id, admin_note, decided_at, created_at, updated_at, domain_id)
+       VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?, ?)`,
       [
         Number.isFinite(orderId) ? orderId : null,
         orderNumber,
@@ -598,6 +607,7 @@ app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requir
         JSON.stringify(requested),
         now,
         now,
+        req.domainId,
       ]
     )
 
@@ -625,7 +635,7 @@ app.post('/api/trackingdetail/orders', requireOtpAccess, async (req, res) => {
     if (!email) return res.status(400).json({ error: 'Valid email is required' })
 
     const limit = Math.min(Math.max(Number(req.body?.limit || 50), 1), 200)
-    const orders = await fetchTrackingDetailsByEmail(email, limit)
+    const orders = await fetchTrackingDetailsByEmail(email, limit, req.domainId)
     return res.json({ email, orders })
   } catch (e) {
     console.error('[tracking-service] failed to fetch orders', e)
@@ -640,7 +650,7 @@ app.post('/api/trackingdetail/orders-by-email', async (req, res) => {
     if (!email) return res.status(400).json({ ok: false, error: 'Valid email is required' })
 
     const limit = req.body?.limit || 50
-    const orders = await fetchTrackingDetailsByEmail(email, limit)
+    const orders = await fetchTrackingDetailsByEmail(email, limit, req.domainId)
     return res.json({ ok: true, orders })
   } catch (e) {
     console.error('[tracking-service] orders-by-email failed', e)
