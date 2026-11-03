@@ -2,609 +2,364 @@
   "info": {
     "name": "Tracking Service API Tests",
     "_postman_id": "b2c3d4e5-f6a7-4890-bcde-f12345678901",
-    "description": "Full API test suite for tracking-service. Run with the matching environment file.\n\nIMPORTANT — this service uses email OTP auth, not username/password, so it cannot be 100% automated end-to-end without a manual step:\n1. Run 'OTP Auth Flow > Request OTP' — this emails a 6-digit code to {{testEmail}} (must be an email that already has at least one order).\n2. Open the email (or check the Resend/Mailjet dashboard, or server logs if RESEND_API_KEY isn't configured), copy the code, and paste it into the collection variable 'otpCode'.\n3. Run 'OTP Auth Flow > Verify OTP' — this captures 'authToken' automatically for every Bearer-protected request below.\n\nAll other folders can be run via Collection Runner without manual steps EXCEPT the ones needing 'authToken': those requests are written to tolerate a 401 gracefully (they check response shape rather than hard-failing) so a full run without step 2 still passes, just without exercising the authenticated behavior.\n\nA 'Server-to-Server (x-api-key)' folder is included for fully automated runs: set environment variable 'apiKey' to match the service's TRACKING_API_KEY (if configured) to bypass the OTP requirement entirely on protected routes.",
+    "description": "API tests for tracking-service.\n\nThere is no OTP. Signed-in customers use the login token issued by user-order-service (same JWT_SECRET):\n1. Run 'Auth > Login' - it stores 'authToken'. Set testEmail/testPassword in the environment first (use an account that has orders on the storefront in 'origin').\n2. Run the Orders and Address Change folders - they send 'Authorization: Bearer {{authToken}}'.\n\nThe storefront is detected from the Origin header, so keep 'origin' set to a storefront in the domains table (e.g. https://noverafitness.com).\n\nThe carrier tracking request uses x-api-key (set 'apiKey' to TRACKING_API_KEY).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
-    { "key": "baseUrl",                       "value": "http://localhost:5002" },
-    { "key": "authToken",                     "value": "" },
-    { "key": "otpCode",                       "value": "" },
-    { "key": "testOrderNumber",               "value": "" },
-    { "key": "testOrderId",                   "value": "" },
-    { "key": "createdAddressChangeRequestId", "value": "" }
+    {
+      "key": "authToken",
+      "value": ""
+    },
+    {
+      "key": "testOrderNumber",
+      "value": ""
+    },
+    {
+      "key": "createdAddressChangeRequestId",
+      "value": ""
+    }
   ],
   "item": [
-
     {
       "name": "Health",
       "item": [
-
         {
-          "name": "Health Check",
-          "request": {
-            "method": "GET",
-            "header": [],
-            "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 200', () => pm.response.to.have.status(200));",
-            "pm.test('Reports connected DB', () => {",
-            "  const j = pm.response.json();",
-            "  pm.expect(j.ok).to.be.true;",
-            "  pm.expect(j).to.have.property('service', 'tracking-service');",
-            "  pm.expect(j).to.have.property('db', 'connected');",
-            "});"
-          ]}}]
-        }
-
-      ]
-    },
-
-    {
-      "name": "OTP Auth Flow",
-      "item": [
-
-        {
-          "name": "Request OTP",
-          "request": {
-            "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\"}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/request-otp", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","request-otp"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 200', () => pm.response.to.have.status(200));",
-            "pm.test('Response is ok (never reveals whether the email exists)', () => {",
-            "  const j = pm.response.json();",
-            "  pm.expect(j.ok).to.be.true;",
-            "});",
-            "console.log('If testEmail has an order, a 6-digit OTP was just emailed. Paste it into the otpCode collection variable, then run Verify OTP.');"
-          ]}}]
-        },
-
-        {
-          "name": "Request OTP - Missing Email → 400",
-          "request": {
-            "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/request-otp", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","request-otp"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 400', () => pm.response.to.have.status(400));",
-            "pm.test('Error message present', () => {",
-            "  const j = pm.response.json();",
-            "  pm.expect(j.ok).to.be.false;",
-            "  pm.expect(j).to.have.property('error', 'Valid email is required');",
-            "});"
-          ]}}]
-        },
-
-        {
-          "name": "Verify OTP",
-          "request": {
-            "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\", \"otp\": \"{{otpCode}}\"}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/verify-otp", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","verify-otp"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Response is JSON', () => pm.response.to.be.json);",
-            "if (pm.response.code === 200) {",
-            "  const j = pm.response.json();",
-            "  pm.test('Has token and expiresIn', () => {",
-            "    pm.expect(j.ok).to.be.true;",
-            "    pm.expect(j).to.have.property('token');",
-            "    pm.expect(j).to.have.property('expiresIn');",
-            "  });",
-            "  pm.collectionVariables.set('authToken', j.token);",
-            "  console.log('authToken captured — Bearer-protected requests below will now run authenticated.');",
-            "} else {",
-            "  pm.test('otpCode not set yet — expected 400 (\"Valid 6-digit OTP is required\" or \"Invalid OTP\")', () => {",
-            "    pm.expect(pm.response.code).to.equal(400);",
-            "    pm.expect(pm.response.json()).to.have.property('error');",
-            "  });",
-            "  console.log('Set the otpCode collection variable to the code emailed to testEmail, then re-run this request.');",
-            "}"
-          ]}}]
-        },
-
-        {
-          "name": "Verify OTP - Invalid Code → 400",
-          "request": {
-            "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\", \"otp\": \"000000\"}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/verify-otp", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","verify-otp"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 400', () => pm.response.to.have.status(400));",
-            "pm.test('Error message present', () => {",
-            "  const j = pm.response.json();",
-            "  pm.expect(j.ok).to.be.false;",
-            "  pm.expect(j).to.have.property('error');",
-            "});"
-          ]}}]
-        },
-
-        {
-          "name": "Verify OTP - Missing Fields → 400",
-          "request": {
-            "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/verify-otp", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","verify-otp"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 400', () => pm.response.to.have.status(400));",
-            "pm.test('Error message present', () => {",
-            "  const j = pm.response.json();",
-            "  pm.expect(j.ok).to.be.false;",
-            "  pm.expect(j).to.have.property('error', 'Valid email is required');",
-            "});"
-          ]}}]
-        }
-
-      ]
-    },
-
-    {
-      "name": "Orders — Public (No Auth)",
-      "item": [
-
-        {
-          "name": "Orders By Email",
-          "request": {
-            "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\", \"limit\": 10}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/orders-by-email", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","orders-by-email"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 200', () => pm.response.to.have.status(200));",
-            "pm.test('Has ok + orders array', () => {",
-            "  const j = pm.response.json();",
-            "  pm.expect(j.ok).to.be.true;",
-            "  pm.expect(j.orders).to.be.an('array');",
-            "});",
-            "const j = pm.response.json();",
-            "if (Array.isArray(j.orders) && j.orders.length > 0) {",
-            "  const first = j.orders[0];",
-            "  pm.test('Each entry has order/items/payments', () => {",
-            "    pm.expect(first).to.have.all.keys('order', 'items', 'payments');",
-            "  });",
-            "  pm.collectionVariables.set('testOrderNumber', first.order.order_number);",
-            "  pm.collectionVariables.set('testOrderId', String(first.order.id));",
-            "  console.log('testOrderNumber/testOrderId captured for downstream requests:', first.order.order_number);",
-            "} else {",
-            "  console.warn('testEmail has no orders — set environment variable testEmail to an email with at least one order for full coverage.');",
-            "}"
-          ]}}]
-        },
-
-        {
-          "name": "Orders By Email - Missing Email → 400",
-          "request": {
-            "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/orders-by-email", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","orders-by-email"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 400', () => pm.response.to.have.status(400));",
-            "pm.test('Error message present', () => {",
-            "  const j = pm.response.json();",
-            "  pm.expect(j.ok).to.be.false;",
-            "  pm.expect(j).to.have.property('error', 'Valid email is required');",
-            "});"
-          ]}}]
-        }
-
-      ]
-    },
-
-    {
-      "name": "Orders — OTP Session (Bearer)",
-      "item": [
-
-        {
-          "name": "Get My Orders (query params)",
-          "request": {
-            "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer {{authToken}}" }],
-            "url": {
-              "raw": "{{baseUrl}}/api/trackingdetail/orders?email={{testEmail}}&limit=10",
-              "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","orders"],
-              "query": [{ "key": "email", "value": "{{testEmail}}" }, { "key": "limit", "value": "10" }]
-            }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "if (pm.response.code === 200) {",
-            "  pm.test('Has email + orders array', () => {",
-            "    const j = pm.response.json();",
-            "    pm.expect(j).to.have.property('email');",
-            "    pm.expect(j.orders).to.be.an('array');",
-            "  });",
-            "} else {",
-            "  pm.test('No authToken yet — expected 401', () => {",
-            "    pm.expect(pm.response.code).to.equal(401);",
-            "    pm.expect(pm.response.json()).to.have.property('error');",
-            "  });",
-            "}"
-          ]}}]
-        },
-
-        {
-          "name": "Get My Orders (body)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{authToken}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\", \"limit\": 10}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/orders", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","orders"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "if (pm.response.code === 200) {",
-            "  pm.test('Has email + orders array', () => {",
-            "    const j = pm.response.json();",
-            "    pm.expect(j).to.have.property('email');",
-            "    pm.expect(j.orders).to.be.an('array');",
-            "  });",
-            "} else {",
-            "  pm.test('No authToken yet — expected 401', () => {",
-            "    pm.expect(pm.response.code).to.equal(401);",
-            "    pm.expect(pm.response.json()).to.have.property('error');",
-            "  });",
-            "}"
-          ]}}]
-        }
-
-      ]
-    },
-
-    {
-      "name": "Carrier Tracking (Bearer)",
-      "item": [
-
-        {
-          "name": "Get Tracking Events",
-          "request": {
-            "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer {{authToken}}" }],
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/tracking/TEST123456789GB", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","tracking","TEST123456789GB"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "// As shipped, TRACKING_EVENTS_API_BASE_URL is unconfigured, so an authenticated call",
-            "// always 400s with 'Tracking events API is not configured'. Once a real carrier",
-            "// provider is wired up server-side, expect 200 + an events array instead.",
-            "if (pm.response.code === 401) {",
-            "  pm.test('No authToken yet — 401 as expected', () => pm.expect(pm.response.json()).to.have.property('error'));",
-            "} else {",
-            "  pm.test('400 (not configured) or 200 (configured)', () => pm.expect(pm.response.code).to.be.oneOf([200, 400]));",
-            "  pm.test('Response has ok field', () => {",
-            "    const j = pm.response.json();",
-            "    pm.expect(j).to.have.property('ok');",
-            "  });",
-            "}"
-          ]}}]
-        }
-
-      ]
-    },
-
-    {
-      "name": "Address Change Requests (Bearer)",
-      "item": [
-
-        {
-          "name": "List Address Change Requests",
-          "request": {
-            "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer {{authToken}}" }],
-            "url": {
-              "raw": "{{baseUrl}}/api/trackingdetail/address-change-requests?email={{testEmail}}",
-              "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","address-change-requests"],
-              "query": [{ "key": "email", "value": "{{testEmail}}" }]
-            }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "if (pm.response.code === 200) {",
-            "  pm.test('Has requests array', () => {",
-            "    const j = pm.response.json();",
-            "    pm.expect(j.requests).to.be.an('array');",
-            "  });",
-            "} else {",
-            "  pm.test('No authToken yet — expected 401', () => pm.expect(pm.response.code).to.equal(401));",
-            "}"
-          ]}}]
-        },
-
-        {
-          "name": "Create Address Change Request",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{authToken}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\", \"shipping_address\": \"99 Postman Test Street\", \"shipping_city\": \"Manchester\", \"shipping_zip\": \"M1 1AA\", \"shipping_country\": \"United Kingdom\"}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/order/{{testOrderNumber}}/address-change-request", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","order","{{testOrderNumber}}","address-change-request"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "// Accepts 200 (created) or 409 (a prior run already left one pending) as both being",
-            "// correct behaviour — this endpoint intentionally refuses a second pending request.",
-            "if (pm.response.code === 200) {",
-            "  pm.test('Created with an id', () => {",
-            "    const j = pm.response.json();",
-            "    pm.expect(j.success).to.be.true;",
-            "    pm.expect(j).to.have.property('id');",
-            "    pm.collectionVariables.set('createdAddressChangeRequestId', String(j.id));",
-            "  });",
-            "} else if (pm.response.code === 409) {",
-            "  pm.test('Already-pending conflict reported correctly', () => {",
-            "    pm.expect(pm.response.json()).to.have.property('error');",
-            "  });",
-            "} else if (pm.response.code === 401) {",
-            "  pm.test('No authToken yet — expected 401', () => pm.expect(pm.response.json()).to.have.property('error'));",
-            "} else {",
-            "  pm.test('Unexpected status', () => pm.expect.fail('Expected 200, 409, or 401 but got ' + pm.response.code));",
-            "}"
-          ]}}]
-        },
-
-        {
-          "name": "Create Address Change Request (Duplicate) → 409",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{authToken}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\", \"shipping_address\": \"another address\"}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/order/{{testOrderNumber}}/address-change-request", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","order","{{testOrderNumber}}","address-change-request"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "if (pm.response.code === 401) {",
-            "  pm.test('No authToken yet — expected 401', () => pm.expect(pm.response.json()).to.have.property('error'));",
-            "} else {",
-            "  pm.test('Status 409 (pending request already exists)', () => pm.response.to.have.status(409));",
-            "  pm.test('Error message present', () => pm.expect(pm.response.json()).to.have.property('error'));",
-            "}"
-          ]}}]
-        },
-
-        {
-          "name": "Create Address Change Request - Missing shipping_address → 400",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{authToken}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\"}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/order/{{testOrderNumber}}/address-change-request", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","order","{{testOrderNumber}}","address-change-request"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "if (pm.response.code === 401) {",
-            "  pm.test('No authToken yet — expected 401', () => pm.expect(pm.response.json()).to.have.property('error'));",
-            "} else {",
-            "  pm.test('Status 400', () => pm.response.to.have.status(400));",
-            "  pm.test('Error message present', () => pm.expect(pm.response.json()).to.have.property('error', 'shipping_address is required'));",
-            "}"
-          ]}}]
-        },
-
-        {
-          "name": "Create Address Change Request - Order Not Found → 404",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{authToken}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\", \"shipping_address\": \"1 Nowhere Road\"}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/order/NON-EXISTENT-ORDER-NUMBER-XYZ/address-change-request", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","order","NON-EXISTENT-ORDER-NUMBER-XYZ","address-change-request"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "if (pm.response.code === 401) {",
-            "  pm.test('No authToken yet — expected 401', () => pm.expect(pm.response.json()).to.have.property('error'));",
-            "} else {",
-            "  pm.test('Status 404', () => pm.response.to.have.status(404));",
-            "  pm.test('Error message present', () => pm.expect(pm.response.json()).to.have.property('error', 'Order not found'));",
-            "}"
-          ]}}]
-        }
-
-      ]
-    },
-
-    {
-      "name": "Server-to-Server (x-api-key)",
-      "item": [
-
-        {
-          "name": "Get Orders (x-api-key)",
-          "request": {
-            "method": "GET",
-            "header": [{ "key": "x-api-key", "value": "{{apiKey}}" }],
-            "url": {
-              "raw": "{{baseUrl}}/api/trackingdetail/orders?email={{testEmail}}&limit=10",
-              "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","orders"],
-              "query": [{ "key": "email", "value": "{{testEmail}}" }, { "key": "limit", "value": "10" }]
-            }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "// Only succeeds if environment variable 'apiKey' matches the service's TRACKING_API_KEY.",
-            "// Left blank by default (matching the shipped .env), so this is expected to 401 out of the box.",
-            "if (pm.response.code === 200) {",
-            "  pm.test('Has email + orders array', () => {",
-            "    const j = pm.response.json();",
-            "    pm.expect(j).to.have.property('email');",
-            "    pm.expect(j.orders).to.be.an('array');",
-            "  });",
-            "} else {",
-            "  pm.test('apiKey not configured — expected 401', () => pm.expect(pm.response.code).to.equal(401));",
-            "}"
-          ]}}]
-        },
-
-        {
-          "name": "Create Address Change Request (x-api-key)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "x-api-key", "value": "{{apiKey}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\"email\": \"{{testEmail}}\", \"shipping_address\": \"5 Server To Server Ave\"}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/order/{{testOrderNumber}}/address-change-request", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","order","{{testOrderNumber}}","address-change-request"] }
-          },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "if (pm.response.code === 401) {",
-            "  pm.test('apiKey not configured — expected 401', () => pm.expect(pm.response.json()).to.have.property('error'));",
-            "} else {",
-            "  pm.test('200 (created) or 409 (already pending)', () => pm.expect(pm.response.code).to.be.oneOf([200, 409]));",
-            "  pm.test('Response has expected shape', () => {",
-            "    const j = pm.response.json();",
-            "    pm.expect(j).to.have.property(pm.response.code === 200 ? 'success' : 'error');",
-            "  });",
-            "}"
-          ]}}]
-        }
-
-      ]
-    },
-
-    {
-      "name": "Error Handling",
-      "item": [
-
-        {
-          "name": "Missing Auth → 401",
+          "name": "Health (root)",
           "request": {
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{baseUrl}}/api/trackingdetail/orders?email={{testEmail}}",
-              "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","orders"],
-              "query": [{ "key": "email", "value": "{{testEmail}}" }]
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
             }
           },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 401', () => pm.response.to.have.status(401));",
-            "pm.test('Error is \"OTP verification required\"', () => {",
-            "  pm.expect(pm.response.json()).to.have.property('error', 'OTP verification required');",
-            "});"
-          ]}}]
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('DB connected', () => { const j = pm.response.json(); pm.expect(j.ok).to.be.true; pm.expect(j.db).to.eql('connected'); });"
+                ]
+              }
+            }
+          ]
         },
-
         {
-          "name": "Invalid Bearer Token → 401",
+          "name": "Health (/api)",
           "request": {
             "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer this.is.not.a.valid.jwt" }],
+            "header": [],
             "url": {
-              "raw": "{{baseUrl}}/api/trackingdetail/orders?email={{testEmail}}",
-              "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","orders"],
-              "query": [{ "key": "email", "value": "{{testEmail}}" }]
+              "raw": "{{baseUrl}}/api/trackingdetail/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trackingdetail",
+                "health"
+              ]
             }
           },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 401', () => pm.response.to.have.status(401));",
-            "pm.test('Error is \"Invalid or expired access token\"', () => {",
-            "  pm.expect(pm.response.json()).to.have.property('error', 'Invalid or expired access token');",
-            "});"
-          ]}}]
-        },
-
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
         {
-          "name": "Verify OTP With No Prior Request → 400",
+          "name": "Login (user-order-service)",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              {
+                "key": "Origin",
+                "value": "{{origin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{userOrderUrl}}/api/auth/login",
+              "host": [
+                "{{userOrderUrl}}"
+              ],
+              "path": [
+                "api",
+                "auth",
+                "login"
+              ]
+            },
             "body": {
               "mode": "raw",
-              "raw": "{\"email\": \"no-otp-ever-requested-for-this-address@example.com\", \"otp\": \"123456\"}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": { "raw": "{{baseUrl}}/api/trackingdetail/verify-otp", "host": ["{{baseUrl}}"], "path": ["api","trackingdetail","verify-otp"] }
+              "raw": "{\n  \"email\": \"{{testEmail}}\",\n  \"password\": \"{{testPassword}}\"\n}"
+            }
           },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 400', () => pm.response.to.have.status(400));",
-            "pm.test('Error is \"Invalid OTP\"', () => {",
-            "  pm.expect(pm.response.json()).to.have.property('error', 'Invalid OTP');",
-            "});"
-          ]}}]
-        },
-
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('Returns a token', () => pm.expect(j.token).to.be.a('string'));",
+                  "pm.collectionVariables.set('authToken', j.token);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Orders",
+      "item": [
         {
-          "name": "Health Check Never Requires Auth",
+          "name": "List my orders",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Origin",
+                "value": "{{origin}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{authToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/trackingdetail/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trackingdetail",
+                "orders"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"limit\": 50\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('Has orders array', () => pm.expect(j.orders).to.be.an('array'));",
+                  "if (j.orders.length) pm.collectionVariables.set('testOrderNumber', j.orders[0].order.order_number);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List orders - no token (expects 401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Origin",
+                "value": "{{origin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/trackingdetail/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trackingdetail",
+                "orders"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"someone@example.com\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Address Change",
+      "item": [
+        {
+          "name": "Create address change request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Origin",
+                "value": "{{origin}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{authToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/trackingdetail/order/{{testOrderNumber}}/address-change-request",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trackingdetail",
+                "order",
+                "{{testOrderNumber}}",
+                "address-change-request"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"shipping_address\": \"99 New Street\",\n  \"shipping_city\": \"Manchester\",\n  \"shipping_zip\": \"M1 1AA\",\n  \"shipping_country\": \"United Kingdom\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 created, or 409 if one is already pending', () => pm.expect([200, 409]).to.include(pm.response.code));",
+                  "if (pm.response.code === 200) pm.collectionVariables.set('createdAddressChangeRequestId', pm.response.json().id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List my address change requests",
           "request": {
             "method": "GET",
-            "header": [{ "key": "Authorization", "value": "Bearer garbage" }],
-            "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] }
+            "header": [
+              {
+                "key": "Origin",
+                "value": "{{origin}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{authToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/trackingdetail/address-change-requests",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trackingdetail",
+                "address-change-requests"
+              ]
+            }
           },
-          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
-            "pm.test('Status 200 regardless of bad Authorization header', () => pm.response.to.have.status(200));"
-          ]}}]
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has requests array', () => pm.expect(pm.response.json().requests).to.be.an('array'));"
+                ]
+              }
+            }
+          ]
         }
-
+      ]
+    },
+    {
+      "name": "Carrier Tracking",
+      "item": [
+        {
+          "name": "Carrier events",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/trackingdetail/tracking/AB123456789GB",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trackingdetail",
+                "tracking",
+                "AB123456789GB"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200, or 400 when no provider is configured', () => pm.expect([200, 400]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        }
       ]
     }
-
   ]
 }

@@ -60,7 +60,12 @@ const DB_USER = env('DB_USER', '')
 const DB_PASS = env('DB_PASS', '')
 const DB_NAME = env('DB_NAME', '')
 
-const corsOrigin = env('CORS_ORIGIN', '*')
+// Extra allowed hosts, comma separated (optional). Active storefront domains from
+// the `domains` table are always allowed - same rule as user-order-service.
+const corsExtraHosts = env('CORS_ORIGIN', '')
+  .split(',')
+  .map((h) => h.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, ''))
+  .filter((h) => h && h !== '*')
 const API_KEY = env('TRACKING_API_KEY', env('TRACKINGDETAIL_API_KEY', ''))
 // Must match JWT_SECRET in user-order-service so its login tokens verify here.
 const JWT_SECRET = env('JWT_SECRET', '')
@@ -69,12 +74,31 @@ const app = express()
 app.set('trust proxy', true)
 app.use(express.json({ limit: '1mb' }))
 
-app.use(
-  cors({
-    origin: corsOrigin === '*' ? true : corsOrigin.split(',').map((s) => s.trim()).filter(Boolean),
-    credentials: true,
-  })
-)
+const corsAllowCache = new Map() // host -> { ok, at }
+async function corsOriginCheck(origin, cb) {
+  try {
+    if (!origin) return cb(null, true) // server-to-server / curl: no browser Origin
+    let host = ''
+    try {
+      host = new URL(origin).hostname.toLowerCase().replace(/^www\./, '')
+    } catch {
+      return cb(null, false)
+    }
+    if (corsExtraHosts.includes(host)) return cb(null, true)
+    if (process.env.NODE_ENV !== 'production' && (host === 'localhost' || host === '127.0.0.1')) return cb(null, true)
+    const hit = corsAllowCache.get(host)
+    if (hit && Date.now() - hit.at < 60000) return cb(null, hit.ok)
+    const [rows] = await pool.execute("SELECT 1 FROM domains WHERE domain_name = ? AND status = 'active' LIMIT 1", [host])
+    const ok = Array.isArray(rows) && rows.length > 0
+    corsAllowCache.set(host, { ok, at: Date.now() })
+    return cb(null, ok)
+  } catch (e) {
+    console.error('[cors] origin check failed:', e?.message || e)
+    return cb(null, false)
+  }
+}
+app.use(cors({ origin: corsOriginCheck, credentials: true }))
+app.options('*', cors({ origin: corsOriginCheck, credentials: true }))
 
 const pool = mysql.createPool(
   DATABASE_URL
@@ -141,6 +165,36 @@ async function ensureOrderAddressChangeRequestsTable() {
     console.error('[tracking-service] ensureOrderAddressChangeRequestsTable failed', e?.message || e)
   }
 }
+
+// Fixed-window in-memory limiter. One process (pm2 fork), so no shared store needed.
+function rateLimit({ windowMs, max, key }) {
+  const hits = new Map() // key -> { count, resetAt }
+  setInterval(() => {
+    const now = Date.now()
+    for (const [k, v] of hits) if (v.resetAt <= now) hits.delete(k)
+  }, windowMs).unref()
+  return (req, res, next) => {
+    const k = key(req)
+    const now = Date.now()
+    let rec = hits.get(k)
+    if (!rec || rec.resetAt <= now) {
+      rec = { count: 0, resetAt: now + windowMs }
+      hits.set(k, rec)
+    }
+    rec.count += 1
+    if (rec.count > max) {
+      res.set('Retry-After', String(Math.ceil((rec.resetAt - now) / 1000)))
+      return res.status(429).json({ error: 'Too many requests. Please try again later.' })
+    }
+    return next()
+  }
+}
+
+const ipLimiter = rateLimit({ windowMs: 60_000, max: 120, key: (req) => req.ip })
+const userLimiter = rateLimit({ windowMs: 60_000, max: 60, key: (req) => req.userEmail })
+const addressChangeLimiter = rateLimit({ windowMs: 15 * 60_000, max: 5, key: (req) => req.userEmail })
+
+app.use('/api/trackingdetail', ipLimiter)
 
 function requireApiKey(req, res, next) {
   if (!API_KEY) return next()
@@ -220,7 +274,8 @@ async function fetchTrackingEventsExternal(trackingNumber) {
 
     return { ok: true, trackingNumber: tn, carrier, events }
   } catch (e) {
-    return { ok: false, error: e?.message || 'Failed to fetch tracking events' }
+    console.error('[tracking-service] carrier lookup failed', e?.message || e)
+    return { ok: false, error: 'Failed to fetch tracking events' }
   }
 }
 
@@ -229,7 +284,8 @@ app.get('/health', async (_req, res) => {
     await pool.query('SELECT 1')
     res.json({ ok: true, service: 'tracking-service', db: 'connected' })
   } catch (e) {
-    res.status(500).json({ ok: false, service: 'tracking-service', db: 'disconnected', error: e?.message || String(e) })
+    console.error('[tracking-service] health check failed', e?.message || e)
+    res.status(500).json({ ok: false, service: 'tracking-service', db: 'disconnected' })
   }
 })
 
@@ -238,7 +294,8 @@ app.get('/api/trackingdetail/health', async (_req, res) => {
     await pool.query('SELECT 1')
     res.json({ ok: true, service: 'tracking-service', db: 'connected' })
   } catch (e) {
-    res.status(500).json({ ok: false, service: 'tracking-service', db: 'disconnected', error: e?.message || String(e) })
+    console.error('[tracking-service] health check failed', e?.message || e)
+    res.status(500).json({ ok: false, service: 'tracking-service', db: 'disconnected' })
   }
 })
 
@@ -249,9 +306,33 @@ app.get('/api/trackingdetail/tracking/:trackingNumber', requireApiKey, async (re
     if (!out.ok) return res.status(400).json(out)
     return res.json(out)
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || 'Failed to fetch tracking' })
+    console.error('[tracking-service] tracking route failed', e)
+    return res.status(500).json({ ok: false, error: 'Failed to fetch tracking' })
   }
 })
+
+// Only these columns are sent to the customer. Rows are still read with SELECT * and
+// filtered here, so internal columns (admin remarks, payment screenshots, invoice
+// metadata, bank account, raw gateway responses, user ids) never leave the server,
+// including columns added to these tables later.
+const CUSTOMER_ORDER_FIELDS = [
+  'order_number', 'status', 'payment_status', 'payment_method', 'currency',
+  'subtotal', 'shipping', 'total', 'discount_amount', 'tracking_number',
+  'customer_name', 'shipping_address', 'shipping_city', 'shipping_state',
+  'shipping_zip', 'shipping_country', 'created_at', 'updated_at',
+]
+const CUSTOMER_ITEM_FIELDS = ['name', 'sku', 'quantity', 'unit_price', 'line_total']
+const CUSTOMER_PAYMENT_FIELDS = ['provider', 'amount', 'currency', 'status', 'created_at']
+const CUSTOMER_ADDRESS_REQUEST_FIELDS = [
+  'id', 'order_number', 'current_shipping_json', 'requested_shipping_json',
+  'status', 'admin_note', 'decided_at', 'created_at', 'updated_at',
+]
+
+function pick(row, fields) {
+  const out = {}
+  for (const f of fields) if (row && row[f] !== undefined) out[f] = row[f]
+  return out
+}
 
 async function fetchTrackingDetailsByEmail(email, limit, domainId) {
   const safeLimit = Math.min(Math.max(Number.parseInt(String(limit), 10) || 50, 1), 200)
@@ -279,7 +360,7 @@ async function fetchTrackingDetailsByEmail(email, limit, domainId) {
   // If we can't determine any order IDs (schema mismatch / unexpected columns),
   // still return the orders instead of crashing with "IN ()" SQL.
   if (!orderIds.length) {
-    return orders.map((o) => ({ order: o, items: [], payments: [] }))
+    return orders.map((o) => ({ order: pick(o, CUSTOMER_ORDER_FIELDS), items: [], payments: [] }))
   }
 
   const placeholders = orderIds.map(() => '?').join(',')
@@ -316,14 +397,14 @@ async function fetchTrackingDetailsByEmail(email, limit, domainId) {
   return orders.map((o) => {
     const oid = getOrderPk(o)
     return {
-      order: o,
-      items: itemsByOrderId.get(oid) || [],
-      payments: paymentsByOrderId.get(oid) || [],
+      order: pick(o, CUSTOMER_ORDER_FIELDS),
+      items: (itemsByOrderId.get(oid) || []).map((it) => pick(it, CUSTOMER_ITEM_FIELDS)),
+      payments: (paymentsByOrderId.get(oid) || []).map((p) => pick(p, CUSTOMER_PAYMENT_FIELDS)),
     }
   })
 }
 
-app.get('/api/trackingdetail/address-change-requests', requireUserAuth, async (req, res) => {
+app.get('/api/trackingdetail/address-change-requests', requireUserAuth, userLimiter, async (req, res) => {
   try {
     const email = req.userEmail
 
@@ -336,14 +417,15 @@ app.get('/api/trackingdetail/address-change-requests', requireUserAuth, async (r
        LIMIT ${Number.isFinite(limit) ? Math.trunc(limit) : 200}`,
       [String(email).trim().toLowerCase(), req.domainId]
     )
-    return res.json({ requests: Array.isArray(rows) ? rows : [] })
+    const list = Array.isArray(rows) ? rows : []
+    return res.json({ requests: list.map((r) => pick(r, CUSTOMER_ADDRESS_REQUEST_FIELDS)) })
   } catch (e) {
     console.error('[tracking-service] failed to fetch address change requests', e)
     return res.status(500).json({ error: 'Failed to fetch address change requests' })
   }
 })
 
-app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requireUserAuth, async (req, res) => {
+app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requireUserAuth, addressChangeLimiter, async (req, res) => {
   let connection
   try {
     const email = req.userEmail
@@ -437,7 +519,7 @@ app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requir
 })
 
 // POST /api/trackingdetail/orders { "email": "someone@example.com" }
-app.post('/api/trackingdetail/orders', requireUserAuth, async (req, res) => {
+app.post('/api/trackingdetail/orders', requireUserAuth, userLimiter, async (req, res) => {
   try {
     const email = req.userEmail
 
@@ -446,7 +528,7 @@ app.post('/api/trackingdetail/orders', requireUserAuth, async (req, res) => {
     return res.json({ email, orders })
   } catch (e) {
     console.error('[tracking-service] failed to fetch orders', e)
-    return res.status(500).json({ error: 'Failed to fetch tracking details', details: e?.message || String(e) })
+    return res.status(500).json({ error: 'Failed to fetch tracking details' })
   }
 })
 
