@@ -14,6 +14,7 @@ import dotenv from 'dotenv'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import jwt from 'jsonwebtoken'
 import { createDomainMiddleware } from './domainMiddleware.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -61,6 +62,8 @@ const DB_NAME = env('DB_NAME', '')
 
 const corsOrigin = env('CORS_ORIGIN', '*')
 const API_KEY = env('TRACKING_API_KEY', env('TRACKINGDETAIL_API_KEY', ''))
+// Must match JWT_SECRET in user-order-service so its login tokens verify here.
+const JWT_SECRET = env('JWT_SECRET', '')
 
 const app = express()
 app.set('trust proxy', true)
@@ -144,6 +147,22 @@ function requireApiKey(req, res, next) {
   const got = String(req.headers['x-api-key'] || '').trim()
   if (!got || got !== API_KEY) return res.status(401).json({ error: 'Unauthorized' })
   return next()
+}
+
+// Signed-in customers only: the email comes from the login token, never from the request.
+function requireUserAuth(req, res, next) {
+  if (!JWT_SECRET) return res.status(500).json({ error: 'Server missing JWT secret' })
+  const m = String(req.headers?.authorization || '').match(/^Bearer\s+(.+)$/i)
+  const token = m ? String(m[1] || '').trim() : ''
+  if (!token) return res.status(401).json({ error: 'Sign in required' })
+  try {
+    const email = normalizeEmail(jwt.verify(token, JWT_SECRET)?.email)
+    if (!email) return res.status(401).json({ error: 'Invalid token' })
+    req.userEmail = email
+    return next()
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' })
+  }
 }
 
 function normalizeEmail(raw) {
@@ -304,26 +323,9 @@ async function fetchTrackingDetailsByEmail(email, limit, domainId) {
   })
 }
 
-// GET /api/trackingdetail/orders?email=someone@example.com
-app.get('/api/trackingdetail/orders', requireApiKey, async (req, res) => {
+app.get('/api/trackingdetail/address-change-requests', requireUserAuth, async (req, res) => {
   try {
-    const email = normalizeEmail(req.query?.email)
-    if (!email) return res.status(400).json({ error: 'Valid email query param is required' })
-
-    const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200)
-
-    const orders = await fetchTrackingDetailsByEmail(email, limit, req.domainId)
-    return res.json({ email, orders })
-  } catch (e) {
-    console.error('[tracking-service] failed to fetch orders', e)
-    return res.status(500).json({ error: 'Failed to fetch tracking details', details: e?.message || String(e) })
-  }
-})
-
-app.get('/api/trackingdetail/address-change-requests', requireApiKey, async (req, res) => {
-  try {
-    const email = normalizeEmail(req.query?.email)
-    if (!email) return res.status(400).json({ error: 'Valid email is required' })
+    const email = req.userEmail
 
     const limit = Math.min(Math.max(Number(req.query?.limit || 200), 1), 500)
     const [rows] = await pool.execute(
@@ -341,11 +343,10 @@ app.get('/api/trackingdetail/address-change-requests', requireApiKey, async (req
   }
 })
 
-app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requireApiKey, async (req, res) => {
+app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requireUserAuth, async (req, res) => {
   let connection
   try {
-    const email = normalizeEmail(req.body?.email)
-    if (!email) return res.status(400).json({ error: 'Valid email is required' })
+    const email = req.userEmail
 
     const orderNumber = String(req.params.orderNumber || '').trim()
     if (!orderNumber) return res.status(400).json({ error: 'orderNumber is required' })
@@ -436,10 +437,9 @@ app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requir
 })
 
 // POST /api/trackingdetail/orders { "email": "someone@example.com" }
-app.post('/api/trackingdetail/orders', requireApiKey, async (req, res) => {
+app.post('/api/trackingdetail/orders', requireUserAuth, async (req, res) => {
   try {
-    const email = normalizeEmail(req.body?.email)
-    if (!email) return res.status(400).json({ error: 'Valid email is required' })
+    const email = req.userEmail
 
     const limit = Math.min(Math.max(Number(req.body?.limit || 50), 1), 200)
     const orders = await fetchTrackingDetailsByEmail(email, limit, req.domainId)
@@ -447,21 +447,6 @@ app.post('/api/trackingdetail/orders', requireApiKey, async (req, res) => {
   } catch (e) {
     console.error('[tracking-service] failed to fetch orders', e)
     return res.status(500).json({ error: 'Failed to fetch tracking details', details: e?.message || String(e) })
-  }
-})
-
-// New endpoint: Fetch orders by email (for authenticated users, no OTP needed)
-app.post('/api/trackingdetail/orders-by-email', async (req, res) => {
-  try {
-    const email = normalizeEmail(req.body?.email)
-    if (!email) return res.status(400).json({ ok: false, error: 'Valid email is required' })
-
-    const limit = req.body?.limit || 50
-    const orders = await fetchTrackingDetailsByEmail(email, limit, req.domainId)
-    return res.json({ ok: true, orders })
-  } catch (e) {
-    console.error('[tracking-service] orders-by-email failed', e)
-    return res.status(500).json({ ok: false, error: 'Failed to fetch orders' })
   }
 })
 
