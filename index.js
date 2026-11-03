@@ -14,9 +14,6 @@ import dotenv from 'dotenv'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import crypto from 'crypto'
-import jwt from 'jsonwebtoken'
-import { sendEmail, brandThemeForDomain } from '../emailService.js'
 import { createDomainMiddleware } from './domainMiddleware.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -64,10 +61,6 @@ const DB_NAME = env('DB_NAME', '')
 
 const corsOrigin = env('CORS_ORIGIN', '*')
 const API_KEY = env('TRACKING_API_KEY', env('TRACKINGDETAIL_API_KEY', ''))
-const JWT_SECRET = env('TRACKING_JWT_SECRET', env('TRACKINGDETAIL_JWT_SECRET', ''))
-const OTP_TTL_SECONDS = Math.min(Math.max(envInt('TRACKING_OTP_TTL_SECONDS', envInt('TRACKINGDETAIL_OTP_TTL_SECONDS', 600)), 60), 1800)
-const OTP_MAX_ATTEMPTS = Math.min(Math.max(envInt('TRACKING_OTP_MAX_ATTEMPTS', envInt('TRACKINGDETAIL_OTP_MAX_ATTEMPTS', 5)), 1), 20)
-const ACCESS_TOKEN_TTL_SECONDS = Math.min(Math.max(envInt('TRACKING_ACCESS_TOKEN_TTL_SECONDS', envInt('TRACKINGDETAIL_ACCESS_TOKEN_TTL_SECONDS', 900)), 60), 3600)
 
 const app = express()
 app.set('trust proxy', true)
@@ -116,33 +109,6 @@ function nowMysqlDatetime() {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
-function addSecondsMysql(sec) {
-  const d = new Date(Date.now() + sec * 1000)
-  const pad = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-}
-
-async function ensureTrackingOtpsTable() {
-  try {
-    await pool.execute(
-      `CREATE TABLE IF NOT EXISTS tracking_otps (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        email VARCHAR(150) NOT NULL,
-        otp_hash CHAR(64) NOT NULL,
-        otp_salt CHAR(32) NOT NULL,
-        expires_at DATETIME NOT NULL,
-        used_at DATETIME NULL,
-        attempts INT NOT NULL DEFAULT 0,
-        created_at DATETIME NOT NULL,
-        INDEX idx_tracking_otps_email (email),
-        INDEX idx_tracking_otps_expires_at (expires_at)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-    )
-  } catch (e) {
-    console.error('[tracking-service] ensureTrackingOtpsTable failed', e?.message || e)
-  }
-}
-
 // NOTE: order_address_change_requests is shared with admin-service, which
 // already creates this table (same columns) against the same Supabase DB.
 // CREATE TABLE IF NOT EXISTS makes this a safe no-op when that's the case.
@@ -180,46 +146,11 @@ function requireApiKey(req, res, next) {
   return next()
 }
 
-function getBearerToken(req) {
-  const raw = String(req.headers?.authorization || '')
-  const m = raw.match(/^Bearer\s+(.+)$/i)
-  return m ? String(m[1] || '').trim() : ''
-}
-
-function requireOtpAccess(req, res, next) {
-  if (API_KEY) {
-    const gotKey = String(req.headers['x-api-key'] || '').trim()
-    if (gotKey && gotKey === API_KEY) return next()
-  }
-
-  const token = getBearerToken(req)
-  if (!token) return res.status(401).json({ error: 'OTP verification required' })
-  if (!JWT_SECRET) return res.status(500).json({ error: 'Server missing JWT secret' })
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET)
-    const email = normalizeEmail(decoded?.email)
-    if (!email) return res.status(401).json({ error: 'Invalid access token' })
-    req.otpEmail = email
-    return next()
-  } catch {
-    return res.status(401).json({ error: 'Invalid or expired access token' })
-  }
-}
-
 function normalizeEmail(raw) {
   const e = String(raw || '').trim().toLowerCase()
   // Very small sanity check. DB has the source of truth.
   if (!e || !e.includes('@') || e.length > 150) return ''
   return e
-}
-
-function generateOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000))
-}
-
-function sha256Hex(raw) {
-  return crypto.createHash('sha256').update(String(raw || ''), 'utf8').digest('hex')
 }
 
 async function fetchTrackingEventsExternal(trackingNumber) {
@@ -292,7 +223,7 @@ app.get('/api/trackingdetail/health', async (_req, res) => {
   }
 })
 
-app.get('/api/trackingdetail/tracking/:trackingNumber', requireOtpAccess, async (req, res) => {
+app.get('/api/trackingdetail/tracking/:trackingNumber', requireApiKey, async (req, res) => {
   try {
     const trackingNumber = String(req.params.trackingNumber || '').trim()
     const out = await fetchTrackingEventsExternal(trackingNumber)
@@ -300,130 +231,6 @@ app.get('/api/trackingdetail/tracking/:trackingNumber', requireOtpAccess, async 
     return res.json(out)
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || 'Failed to fetch tracking' })
-  }
-})
-
-app.post('/api/trackingdetail/request-otp', async (req, res) => {
-  let connection
-  try {
-    const email = normalizeEmail(req.body?.email)
-    if (!email) return res.status(400).json({ ok: false, error: 'Valid email is required' })
-
-    connection = await pool.getConnection()
-    const [ordersRows] = await connection.execute(
-      'SELECT id FROM orders WHERE LOWER(TRIM(customer_email)) = ? LIMIT 1',
-      [email]
-    )
-
-    const hasOrder = Array.isArray(ordersRows) && ordersRows.length > 0
-
-    if (hasOrder) {
-      const otp = generateOtp()
-      const salt = crypto.randomBytes(16).toString('hex')
-      const otpHash = sha256Hex(`${salt}:${otp}`)
-      const createdAt = nowMysqlDatetime()
-      const expiresAt = addSecondsMysql(OTP_TTL_SECONDS)
-
-      await connection.execute(
-        `INSERT INTO tracking_otps (email, otp_hash, otp_salt, expires_at, used_at, attempts, created_at, domain_id)
-         VALUES (?, ?, ?, ?, NULL, 0, ?, ?)`,
-        [email, otpHash, salt, expiresAt, createdAt, req.domainId]
-      )
-
-      try {
-        await sendEmail(
-          email,
-          'Your Alluvi Track Order OTP',
-          'tracking_otp',
-          { otp, expiresMinutes: Math.ceil(OTP_TTL_SECONDS / 60), brandTheme: brandThemeForDomain(req.domain) }
-        )
-      } catch (e) {
-        console.error('[tracking-service] OTP email send failed', e?.message || e)
-      }
-    }
-
-    return res.json({ ok: true })
-  } catch (e) {
-    console.error('[tracking-service] request-otp failed', e)
-    return res.status(500).json({ ok: false, error: 'Failed to request OTP' })
-  } finally {
-    if (connection) connection.release()
-  }
-})
-
-app.post('/api/trackingdetail/verify-otp', async (req, res) => {
-  let connection
-  try {
-    const email = normalizeEmail(req.body?.email)
-    const otp = String(req.body?.otp || '').trim()
-    if (!email) return res.status(400).json({ ok: false, error: 'Valid email is required' })
-    if (!otp || !/^[0-9]{6}$/.test(otp)) return res.status(400).json({ ok: false, error: 'Valid 6-digit OTP is required' })
-
-    if (!JWT_SECRET) return res.status(500).json({ ok: false, error: 'Server missing JWT secret' })
-
-    connection = await pool.getConnection()
-    await connection.beginTransaction()
-
-    const [rows] = await connection.execute(
-      `SELECT id, otp_hash, otp_salt, expires_at, used_at, attempts
-       FROM tracking_otps
-       WHERE email = ?
-       ORDER BY id DESC
-       LIMIT 1
-       FOR UPDATE`,
-      [email]
-    )
-
-    const list = Array.isArray(rows) ? rows : []
-    if (!list.length) {
-      await connection.rollback()
-      return res.status(400).json({ ok: false, error: 'Invalid OTP' })
-    }
-
-    const rec = list[0]
-    if (rec.used_at) {
-      await connection.rollback()
-      return res.status(400).json({ ok: false, error: 'OTP already used. Please request a new OTP.' })
-    }
-
-    const exp = new Date(rec.expires_at)
-    if (Number.isNaN(exp.getTime()) || exp.getTime() < Date.now()) {
-      await connection.rollback()
-      return res.status(400).json({ ok: false, error: 'OTP expired. Please request a new OTP.' })
-    }
-
-    const attempts = Number(rec.attempts || 0)
-    if (attempts >= OTP_MAX_ATTEMPTS) {
-      await connection.rollback()
-      return res.status(400).json({ ok: false, error: 'Too many attempts. Please request a new OTP.' })
-    }
-
-    const computed = sha256Hex(`${String(rec.otp_salt || '')}:${otp}`)
-    const match = computed === String(rec.otp_hash || '')
-
-    if (!match) {
-      await connection.execute('UPDATE tracking_otps SET attempts = attempts + 1 WHERE id = ?', [rec.id])
-      await connection.commit()
-      return res.status(400).json({ ok: false, error: 'Invalid OTP' })
-    }
-
-    await connection.execute('UPDATE tracking_otps SET used_at = ? WHERE id = ?', [nowMysqlDatetime(), rec.id])
-    await connection.commit()
-
-    const token = jwt.sign({ email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL_SECONDS })
-    return res.json({ ok: true, token, expiresIn: ACCESS_TOKEN_TTL_SECONDS })
-  } catch (e) {
-    if (connection) {
-      try {
-        await connection.rollback()
-      } catch {
-        // ignore
-      }
-    }
-    console.error('[tracking-service] verify-otp failed', e)
-    return res.status(500).json({ ok: false, error: 'Failed to verify OTP' })
-  } finally {
-    if (connection) connection.release()
   }
 })
 
@@ -498,9 +305,9 @@ async function fetchTrackingDetailsByEmail(email, limit, domainId) {
 }
 
 // GET /api/trackingdetail/orders?email=someone@example.com
-app.get('/api/trackingdetail/orders', requireOtpAccess, async (req, res) => {
+app.get('/api/trackingdetail/orders', requireApiKey, async (req, res) => {
   try {
-    const email = req.otpEmail ? String(req.otpEmail) : normalizeEmail(req.query?.email)
+    const email = normalizeEmail(req.query?.email)
     if (!email) return res.status(400).json({ error: 'Valid email query param is required' })
 
     const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200)
@@ -513,9 +320,9 @@ app.get('/api/trackingdetail/orders', requireOtpAccess, async (req, res) => {
   }
 })
 
-app.get('/api/trackingdetail/address-change-requests', requireOtpAccess, async (req, res) => {
+app.get('/api/trackingdetail/address-change-requests', requireApiKey, async (req, res) => {
   try {
-    const email = req.otpEmail ? String(req.otpEmail) : normalizeEmail(req.query?.email)
+    const email = normalizeEmail(req.query?.email)
     if (!email) return res.status(400).json({ error: 'Valid email is required' })
 
     const limit = Math.min(Math.max(Number(req.query?.limit || 200), 1), 500)
@@ -534,10 +341,10 @@ app.get('/api/trackingdetail/address-change-requests', requireOtpAccess, async (
   }
 })
 
-app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requireOtpAccess, async (req, res) => {
+app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requireApiKey, async (req, res) => {
   let connection
   try {
-    const email = req.otpEmail ? String(req.otpEmail) : normalizeEmail(req.body?.email)
+    const email = normalizeEmail(req.body?.email)
     if (!email) return res.status(400).json({ error: 'Valid email is required' })
 
     const orderNumber = String(req.params.orderNumber || '').trim()
@@ -629,9 +436,9 @@ app.post('/api/trackingdetail/order/:orderNumber/address-change-request', requir
 })
 
 // POST /api/trackingdetail/orders { "email": "someone@example.com" }
-app.post('/api/trackingdetail/orders', requireOtpAccess, async (req, res) => {
+app.post('/api/trackingdetail/orders', requireApiKey, async (req, res) => {
   try {
-    const email = req.otpEmail ? String(req.otpEmail) : normalizeEmail(req.body?.email)
+    const email = normalizeEmail(req.body?.email)
     if (!email) return res.status(400).json({ error: 'Valid email is required' })
 
     const limit = Math.min(Math.max(Number(req.body?.limit || 50), 1), 200)
@@ -663,6 +470,5 @@ app.listen(PORT, () => {
 })
 
 ;(async () => {
-  await ensureTrackingOtpsTable()
   await ensureOrderAddressChangeRequestsTable()
 })().catch(() => {})
